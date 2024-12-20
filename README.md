@@ -31,11 +31,12 @@ Next, install `mimicgen_environments` and `robosuite_task_zoo`, by navigating to
 ```
 git clone https://github.com/NVlabs/mimicgen_environments
 cd mimicgen_environments
+git checkout 45db4b35a5a79e82ca8a70ce1321f855498ca82c
 pip install -e .
 cd ..
 git clone https://github.com/ARISE-Initiative/robosuite-task-zoo
-git checkout 74eab7f88214c21ca1ae8617c2b2f8d19718a9ed
 cd robosuite_task_zoo
+git checkout 74eab7f88214c21ca1ae8617c2b2f8d19718a9ed
 pip install -e .
 ```
 
