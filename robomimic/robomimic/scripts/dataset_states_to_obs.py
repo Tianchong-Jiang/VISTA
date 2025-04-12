@@ -377,14 +377,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
+        default="/share/data/ripl/tianchong/vista/data/low_dim_v141.hdf5",
         help="path to input hdf5 dataset",
     )
     # name of hdf5 to write - it will be in the same directory as @dataset
     parser.add_argument(
         "--output_name",
         type=str,
-        required=True,
+        default="low_dim_v141_obs.hdf5",
         help="name of output hdf5 dataset",
     )
 
@@ -409,21 +409,21 @@ if __name__ == "__main__":
         "--camera_names",
         type=str,
         nargs='+',
-        default=[],
+        default=["agentview"],
         help="(optional) camera name(s) to use for image observations. Leave out to not use image observations.",
     )
 
     parser.add_argument(
         "--camera_height",
         type=int,
-        default=84,
+        default=256,
         help="(optional) height of image observations",
     )
 
     parser.add_argument(
         "--camera_width",
         type=int,
-        default=84,
+        default=256,
         help="(optional) width of image observations",
     )
 
@@ -441,7 +441,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--done_mode",
         type=int,
-        default=0,
+        default=1,
         help="how to write done signal. If 0, done is 1 whenever s' is a success state.\
             If 1, done is 1 at the end of each trajectory. If 2, both.",
     )
