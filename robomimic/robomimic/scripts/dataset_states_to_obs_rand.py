@@ -17,14 +17,16 @@ including Plücker ray maps for each unique view.
  │   │   │   ├─ cam_1_image   (...)
  │   │   │   └─ cam_2_image   (...)
  │   │   ├─ next_obs/         (same three *_image datasets)
- │   │   ├─ plucker/
- │   │   │   ├─ cam_0_plucker (H, W, 6)  float32
- │   │   │   ├─ cam_1_plucker (...)
- │   │   │   └─ cam_2_plucker (...)
- │   │   └─ attrs {camera_poses, model_file, num_samples}
+ │   │   └─ attrs {cam_inds, model_file, num_samples}
  │   ├─ demo_1               # cameras 1,2,3 (sliding window)
  │   ├─ demo_2               # cameras 2,3,4
- │   └─ attrs  {total, env_args, all_camera_poses, total_cameras}
+ │   ├─ train_plucker/       # Plücker maps for train cameras (IDs < test_start)
+ │   │   ├─ cam_0_plucker    (H, W, 6)  float32
+ │   │   └─ ...              (...)
+ │   ├─ test_plucker/        # 100 held‑out cameras (IDs ≥ test_start)
+ │   │   ├─ cam_123_plucker  (H, W, 6)  float32
+ │   │   └─ ...              (...)
+ │   └─ attrs  {total, env_args, all_camera_poses, test_cam_inds, train_cam_inds, num_total_cams}
  └─ mask (optional; copied from source dataset)
 
  Notes
@@ -32,7 +34,7 @@ including Plücker ray maps for each unique view.
  • Cameras follow a sliding-window pattern: demo 0 → 0,1,2 ; demo 1 → 1,2,3 ; etc.
  • Each Plücker dataset is stored **once per camera per demo** (shape HxWx6) because
    the ray map depends only on camera geometry, not on timestep.
- • `total_cameras = num_views + (num_demos-1) * k`.
+ • `total_cameras = num_views + (num_demos-1) * k + n_test_cams`.
 """
 import os
 import json
@@ -150,7 +152,7 @@ def add_visualization_to_xml(env, camera_poses, camera_height, camera_width, fru
         c2w[:3, 3] = cam_pos
         # Use PluckerEmbedder to get ray origins and directions for the sample pixels
         embedder = PluckerEmbedder(img_size=(camera_height, camera_width), device=torch.device("cpu"))
-        rays = embedder(torch.tensor(K, device=torch.device("cpu")).unsqueeze(0), torch.tensor(c2w, device=torch.device("cpu")).unsqueeze(0))
+        rays = embedder(torch.tensor(K, device=torch.device("cpu")).unsqueeze(0), torch.tensor(c2w).unsqueeze(0))
         origins = rays["origins"][0].numpy()   # shape (H, W, 3)
         viewdirs = rays["viewdirs"][0].numpy() # shape (H, W, 3)
         # Place a small sphere along each sample ray direction (colored points in the image)
@@ -200,9 +202,11 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
         camera_width=camera_width,
         reward_shaping=False
     )
+
     # Prepare output files
     input_file = h5py.File(dataset_path, "r")
     demos = list(input_file["data"].keys())
+
     # Sort demos by index (assuming names like 'demo_0', 'demo_1', ...)
     demos.sort(key=lambda x: int(x.split('_')[-1]))
     if num_demos is not None and num_demos > 0:
@@ -211,130 +215,81 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
     output_file = h5py.File(output_path, "w")
     data_grp = output_file.create_group("data")
     
-    # Initialize global camera index and storage for their poses
-    global_cam_counter = 0
-    global_cam_poses = {}  # {global_id: (position, rotation)}
+    # -------------------------------------------------------------
+    # Precompute all camera poses and Plücker maps (train + test)
+    # -------------------------------------------------------------
+    n_test_cams = 100  # held‑out cameras for evaluation
+    total_needed_cams = num_views + max(0, len(demos) - 1) * k + n_test_cams
+
+    target_pos = np.array([0.0, 0.0, 0.85])  # target the cameras look at
+    embedder = PluckerEmbedder(img_size=(camera_height, camera_width), device=torch.device("cpu"))
+
+    # Build shared intrinsics once (from reference camera)
+    ref_cam_id_env = env.env.sim.model.camera_name2id(camera_names[0])
+    fovy_ref = env.env.sim.model.cam_fovy[ref_cam_id_env]
+    fovy_rad = fovy_ref * np.pi / 180.0
+    focal_len = (camera_height / 2.0) / np.tan(fovy_rad / 2.0)
+    cx_ref, cy_ref = (camera_width - 1) / 2.0, (camera_height - 1) / 2.0
+    K_ref = np.array([[focal_len, 0.0, cx_ref],
+                      [0.0, focal_len, cy_ref],
+                      [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    global_cam_poses = {}
+    global_plk_maps = {}
+
+    sampled_poses = sample_lookat_poses(target_pos, sampling_radius, num_samples=total_needed_cams)
+    for cam_id, (cam_pos, cam_rot) in enumerate(sampled_poses):
+        global_cam_poses[cam_id] = (cam_pos, cam_rot)
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = cam_rot
+        c2w[:3, 3] = cam_pos
+        rays = embedder(torch.tensor(K_ref).unsqueeze(0), torch.tensor(c2w).unsqueeze(0))
+        global_plk_maps[cam_id] = rays["plucker"][0].numpy().astype(np.float32)
+
     total_samples = 0
+
     # Prepare mask filtering if exists
     new_mask_entries = {mask_key: np.array([], dtype='|S8') for mask_key in input_file.get("mask", {})}
-    # Pre-instantiate PluckerEmbedder for ray map computation (on CPU)
-    embedder = PluckerEmbedder(img_size=(camera_height, camera_width), device=torch.device("cpu"))
-    target_pos = np.array([0.0, 0.0, 0.85])  # target point cameras look at (adjust as needed)
+
     # Process each selected demo
     for idx, ep in enumerate(tqdm(demos, desc="Demos")):
         ep_group = input_file[f"data/{ep}"]
         states = ep_group["states"][()]       # shape (T, ...) low-dimensional states
         actions = ep_group["actions"][()]     # shape (T-1, ...) actions
-        # Initialize or update camera views for this demo
-        current_cam_indices = []
-        current_cam_plucker_maps = {}  # Store Plücker maps for each camera in this demo
-        
-        if idx == 0 or len(global_cam_poses) == 0:
-            # First demo: sample num_views new camera poses
-            new_poses = sample_lookat_poses(target_pos, sampling_radius, num_samples=num_views)
-            for pose in new_poses:
-                cam_id = global_cam_counter
-                global_cam_counter += 1
-                global_cam_poses[cam_id] = pose
-                current_cam_indices.append(cam_id)
-                # Compute Plücker ray map for this camera
-                cam_pos, cam_rot = pose
-                # Build intrinsics (assuming same fovy for all cameras from this env)
-                ref_cam_id = env.env.sim.model.camera_name2id(camera_names[0])
-                fovy = env.env.sim.model.cam_fovy[ref_cam_id]
-                fovy_rad = fovy * np.pi / 180.0
-                focal = (camera_height / 2.0) / np.tan(fovy_rad / 2.0)
-                cx = (camera_width - 1) / 2.0
-                cy = (camera_height - 1) / 2.0
-                K = np.array([[focal, 0.0, cx],
-                              [0.0, focal, cy],
-                              [0.0, 0.0, 1.0]], dtype=np.float32)
-                c2w = np.eye(4, dtype=np.float32)
-                c2w[:3, :3] = cam_rot
-                c2w[:3, 3] = cam_pos
-                rays = embedder(torch.tensor(K, device=torch.device("cpu")).unsqueeze(0), torch.tensor(c2w, device=torch.device("cpu")).unsqueeze(0))
-                plucker_map = rays["plucker"][0].numpy().astype(np.float32)  # shape (H, W, 6)
-                current_cam_plucker_maps[cam_id] = plucker_map
-        else:
-            # Subsequent demo: retain last (num_views - k) views and add k new views
-            keep_count = max(0, num_views - k)
-            keep_ids = prev_cam_indices[-keep_count:] if keep_count > 0 else []
-            # Sample k new camera poses
-            new_poses = sample_lookat_poses(target_pos, sampling_radius, num_samples=k)
-            new_ids = []
-            for pose in new_poses:
-                cam_id = global_cam_counter
-                global_cam_counter += 1
-                global_cam_poses[cam_id] = pose
-                new_ids.append(cam_id)
-                # Compute Plücker ray map for the new camera
-                cam_pos, cam_rot = pose
-                ref_cam_id = env.env.sim.model.camera_name2id(camera_names[0])
-                fovy = env.env.sim.model.cam_fovy[ref_cam_id]
-                fovy_rad = fovy * np.pi / 180.0
-                focal = (camera_height / 2.0) / np.tan(fovy_rad / 2.0)
-                cx = (camera_width - 1) / 2.0
-                cy = (camera_height - 1) / 2.0
-                K = np.array([[focal, 0.0, cx],
-                              [0.0, focal, cy],
-                              [0.0, 0.0, 1.0]], dtype=np.float32)
-                c2w = np.eye(4, dtype=np.float32)
-                c2w[:3, :3] = cam_rot
-                c2w[:3, 3] = cam_pos
-                rays = embedder(torch.tensor(K, device=torch.device("cpu")).unsqueeze(0), torch.tensor(c2w, device=torch.device("cpu")).unsqueeze(0))
-                plucker_map = rays["plucker"][0].numpy().astype(np.float32)
-                current_cam_plucker_maps[cam_id] = plucker_map
-                
-            # For retained cameras, load their Plücker maps
-            for cam_id in keep_ids:
-                cam_pos, cam_rot = global_cam_poses[cam_id]
-                ref_cam_id = env.env.sim.model.camera_name2id(camera_names[0])
-                fovy = env.env.sim.model.cam_fovy[ref_cam_id]
-                fovy_rad = fovy * np.pi / 180.0
-                focal = (camera_height / 2.0) / np.tan(fovy_rad / 2.0)
-                cx = (camera_width - 1) / 2.0
-                cy = (camera_height - 1) / 2.0
-                K = np.array([[focal, 0.0, cx],
-                              [0.0, focal, cy],
-                              [0.0, 0.0, 1.0]], dtype=np.float32)
-                c2w = np.eye(4, dtype=np.float32)
-                c2w[:3, :3] = cam_rot
-                c2w[:3, 3] = cam_pos
-                rays = embedder(torch.tensor(K, device=torch.device("cpu")).unsqueeze(0), torch.tensor(c2w, device=torch.device("cpu")).unsqueeze(0))
-                plucker_map = rays["plucker"][0].numpy().astype(np.float32)
-                current_cam_plucker_maps[cam_id] = plucker_map
-                
-            # Construct the camera indices in the right order for the sliding window
-            current_cam_indices = keep_ids + new_ids
-        # Save current list for next iteration
-        prev_cam_indices = current_cam_indices.copy()
+
+        current_cam_indices = list(range(idx * k, idx * k + num_views))
+
         # Reset environment to initial state of this demo
         initial_state = {"states": states[0], "model": ep_group.attrs["model_file"]}
         env.reset_to(initial_state)  # load model and set initial simulation state
+
         # Store the base XML for resets
         base_xml = env.env.sim.model.get_xml()
-        # Prepare trajectory data containers
+
         traj_obs_list = []
         traj_next_obs_list = []
         traj_rewards = []
         traj_dones = []
-        # Get initial observation and render images from all views for state 0
-        # Create initial empty observation dictionary
         obs = {}
+
         # Add non-image observations if available
         if hasattr(env, "observe"):
             obs = env.observe()
         elif hasattr(env.env, "get_obs"):
             obs = env.env.get_obs()
         
-        # Remove any default image keys from env obs (we will add our own)
-        for key in list(obs.keys()):
-            if key.endswith("_image"):
-                obs.pop(key)
+        # # Remove any default image keys from env obs (we will add our own)
+        # for key in list(obs.keys()):
+        #     if key.endswith("_image"):
+        #         obs.pop(key)
+        # assert no image keys in obs
+        assert not any(key.endswith("_image") for key in obs.keys()), "Image keys should not be present in obs"
+                
         # Render images for each camera view at initial state
         state_index = 0  # time step index
         for j, cam_id in enumerate(current_cam_indices):
             cam_pos, cam_rot = global_cam_poses[cam_id]
+
             # If visualization of frustums is enabled, add markers
             if visualize:
                 if j > 0:
@@ -342,9 +297,11 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
                     env.reset()
                     env.env.reset_from_xml_string(base_xml)
                     env.reset_to({"states": states[state_index]})
+
                 # Inject visualization geoms for this camera
                 mod_xml = add_visualization_to_xml(env, [(cam_pos, cam_rot)], camera_height, camera_width,
                                                    frustum_depth=frustum_depth, time_id=state_index)
+                
                 # Save current sim state, load modified XML, then restore state
                 qpos = env.env.sim.data.qpos.copy()
                 qvel = env.env.sim.data.qvel.copy()
@@ -353,22 +310,21 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
                 env.env.sim.data.qpos[:] = qpos[:env.env.sim.model.nq]
                 env.env.sim.data.qvel[:] = qvel[:env.env.sim.model.nv]
                 env.env.sim.forward()
+
             # Position the camera (overwriting any default position)
+            # Important: there cannot be env.env.sim.forward() between the camera position and rendering
+            # Otherwise, the camera pose will be overwritten by the default camera pose
             ref_cam_id = env.env.sim.model.camera_name2id(camera_names[0])
             env.env.sim.data.cam_xpos[ref_cam_id] = cam_pos
             env.env.sim.data.cam_xmat[ref_cam_id] = cam_rot.flatten()
+
             # Render RGB image from this camera
             img = env.env.sim.render(camera_name=camera_names[0], width=camera_width, height=camera_height, depth=False)
             img = np.flipud(img)  # flip vertical if needed (MuJoCo often returns images upside-down)
             obs[f"cam_{cam_id}_image"] = img  # attach image to observation
-        # Deep copy obs for safety (it will be reused/modified)
-        obs = deepcopy(obs)
-        # Iterate through each action step in the demo
-        # Use range(len(actions)) for actions, but make sure we don't go out of bounds on states
-        # Typically len(states) = len(actions) + 1
         
-        for i in range(min(len(actions), len(states) - 1)): # TEMP
-        # for i in range(3):
+        # for i in range(min(len(actions), len(states) - 1)):
+        for i in range(3):  # TEMP
             # Apply action or set next state
             # If not the last step, we directly reset to the next state (to exactly match recorded state)
             next_state = {"states": states[i+1]}
@@ -414,8 +370,7 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
                 img = env.env.sim.render(camera_name=camera_names[0], width=camera_width, height=camera_height, depth=False)
                 img = np.flipud(img)
                 next_obs[f"cam_{cam_id}_image"] = img
-            next_obs = deepcopy(next_obs)
-            # Compute reward and done flag for this transition
+                
             r = env.get_reward() if hasattr(env, "get_reward") else 0.0
             success = False
             if hasattr(env, "is_success"):
@@ -449,16 +404,8 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
         for key in traj_obs:
             ep_out.create_dataset(f"obs/{key}", data=np.array(traj_obs[key]))
             ep_out.create_dataset(f"next_obs/{key}", data=np.array(traj_next_obs[key]))
-        # Save camera poses metadata (global camera indices and their poses for this demo)
-        camera_info = []
-        for cam_id in current_cam_indices:
-            cam_pos, cam_rot = global_cam_poses[cam_id]
-            camera_info.append({
-                "id": int(cam_id),
-                "position": cam_pos.tolist(),
-                "rotation": cam_rot.tolist()
-            })
-        ep_out.attrs["camera_poses"] = json.dumps(camera_info)
+        # record which cameras this demo uses
+        ep_out.attrs["cam_inds"] = json.dumps(current_cam_indices)
         ep_out.attrs["model_file"] = ep_group.attrs["model_file"]
         ep_out.attrs["num_samples"] = actions.shape[0]  # number of transitions
         # Update mask filters if present
@@ -467,12 +414,6 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
                 new_mask_entries[mask_key] = np.append(new_mask_entries[mask_key], ep_name.encode("utf-8"))
         total_samples += actions.shape[0]
 
-        # ------------------------------------------------------------------
-        # Store each camera's Plücker map once (shape H×W×6, no time dim)
-        # ------------------------------------------------------------------
-        plk_grp = ep_out.create_group("plucker")
-        for cam_id in current_cam_indices:
-            plk_grp.create_dataset(f"cam_{cam_id}_plucker", data=current_cam_plucker_maps[cam_id])
     # Write mask groups if any
     if "mask" in input_file:
         mask_grp = output_file.create_group("mask")
@@ -491,20 +432,40 @@ def dataset_states_to_obs_rand(dataset_path, output_name, num_demos=None, camera
             "rotation": cam_rot.tolist()
         })
     data_grp.attrs["all_camera_poses"] = json.dumps(all_cam_info)
-    data_grp.attrs["total_cameras"] = global_cam_counter
-    
+    # define camera index sets
+    test_start = total_needed_cams - n_test_cams
+    train_cam_inds = list(range(0, test_start))
+    test_cam_inds = list(range(test_start, total_needed_cams))
+    data_grp.attrs["train_cam_inds"] = json.dumps(train_cam_inds)
+    data_grp.attrs["test_cam_inds"] = json.dumps(test_cam_inds)
+    data_grp.attrs["num_total_cams"] = len(global_cam_poses)
+
+    # ----------------------------------------------------------
+    # Save train camera Plücker maps (no per‑demo duplication)
+    # ----------------------------------------------------------
+    train_grp = data_grp.create_group("train_plucker")
+    for cam_id in train_cam_inds:
+        train_grp.create_dataset(f"cam_{cam_id}_plucker", data=global_plk_maps[cam_id])
+
+    # ----------------------------------------------------------
+    # Save held‑out test camera Plücker maps and poses
+    # ----------------------------------------------------------
+    test_grp = data_grp.create_group("test_plucker")
+    for cam_id in range(test_start, total_needed_cams):
+        test_grp.create_dataset(f"cam_{cam_id}_plucker", data=global_plk_maps[cam_id])
+
     # Close files and environment
     input_file.close()
     output_file.close()
     env.env.close()
     print(f"Saved {len(demos)} demos to {output_path}")
-    print(f"Included Plücker ray maps for {global_cam_counter} unique views in the same file")
+    print(f"Included Plücker ray maps for {len(global_cam_poses)} unique views in the same file")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default="/share/data/ripl/tianchong/vista/data/low_dim_v141.hdf5")
-    parser.add_argument("--output_name", type=str, default="low_dim_v141_randcam.hdf5")
-    parser.add_argument("--num_demos", type=int, default=100, help="Total number of demos to process (all if -1)")
+    parser.add_argument("--output_name", type=str, default="low_dim_v141_randcam_test.hdf5")
+    parser.add_argument("--num_demos", type=int, default=3, help="Total number of demos to process (all if -1)")
     parser.add_argument("--num_views", type=int, default=3, help="Number of random camera views per demo")
     parser.add_argument("--k", type=int, default=1, help="Number of camera views to replace for each new demo")
     parser.add_argument("--camera_names", type=str, nargs='+', default=["agentview"], help="Camera name(s) in the environment to use for rendering")

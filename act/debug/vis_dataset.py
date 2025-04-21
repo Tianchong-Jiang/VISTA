@@ -21,6 +21,14 @@ def visualize_dataset(dataset_path, output_dir, num_images=100):
         print(f"Dataset: {dataset_path} | {len(demo_keys)} demos")
         
         print("Discovering camera keys per demo…")
+        # -----------------------------
+        # Load global camera metadata
+        # -----------------------------
+        data_root = f['data']
+        all_cam_info_list = json.loads(data_root.attrs['all_camera_poses'])
+        all_cam_info = {entry['id']: entry for entry in all_cam_info_list}
+        train_cam_inds = set(json.loads(data_root.attrs['train_cam_inds']))
+        
         demo_to_keys = {}
         for d in demo_keys:
             d_obs = f'data/{d}/obs'
@@ -41,10 +49,10 @@ def visualize_dataset(dataset_path, output_dir, num_images=100):
 
             image_keys_for_demo = demo_to_keys[demo_key]
 
-            # Get camera poses
-            if 'camera_poses' not in f[demo_path].attrs:
+            # Check that this demo has camera index list
+            if 'cam_inds' not in f[demo_path].attrs:
                 continue
-            camera_poses_data = json.loads(f[demo_path].attrs['camera_poses'])
+            cam_inds = json.loads(f[demo_path].attrs['cam_inds'])
 
             # Choose a single timestep uniformly for this demo
             any_img_path = f'data/{demo_key}/obs/{image_keys_for_demo[0]}'
@@ -56,8 +64,7 @@ def visualize_dataset(dataset_path, output_dir, num_images=100):
                 valid_samples.append({
                     'demo': demo_key,
                     'timestep': chosen_t,
-                    'key': img_key,
-                    'camera_poses': camera_poses_data
+                    'key': img_key
                 })
         
         print(f"Found {len(valid_samples)} valid images")
@@ -70,7 +77,6 @@ def visualize_dataset(dataset_path, output_dir, num_images=100):
             demo_key = sample['demo']
             timestep = sample['timestep']
             img_key = sample['key']
-            camera_poses_data = sample['camera_poses']
             
             # Get demo number
             demo_num = int(demo_key.split('_')[-1])
@@ -80,7 +86,10 @@ def visualize_dataset(dataset_path, output_dir, num_images=100):
             
             # Extract camera info using global camera ID from image key
             global_cam_id = int(img_key.split("_")[1])  # e.g., cam_2_image -> 2
-            cam_data = next(cd for cd in camera_poses_data if cd['id'] == global_cam_id)
+            cam_data = all_cam_info.get(global_cam_id)
+            if cam_data is None:
+                # should not happen – skip if pose missing
+                continue
             pos = cam_data['position']
             camera_xyz = f"xyz_{pos[0]:.2f}_{pos[1]:.2f}_{pos[2]:.2f}"
             
@@ -105,9 +114,13 @@ def visualize_dataset(dataset_path, output_dir, num_images=100):
                 rng = np.where(mx - mn == 0, 1, mx - mn)
                 return np.clip((arr - mn) / rng * 255.0, 0, 255).astype(np.uint8)
 
-            # Load Plücker map (H, W, 6) – stored once per camera per demo
-            plk_key = img_key.replace("_image", "_plucker")
-            plk = f[f'data/{demo_key}/plucker/{plk_key}'][()]
+            # Load Plücker map from train or test group (stored once globally)
+            plk_dataset = (
+                f'data/train_plucker/cam_{global_cam_id}_plucker'
+                if global_cam_id in train_cam_inds else
+                f'data/test_plucker/cam_{global_cam_id}_plucker'
+            )
+            plk = f[plk_dataset][()]
             # Split into first three and last three channels
             plk012 = to_uint8(plk[..., 0:3])
             plk345 = to_uint8(plk[..., 3:6])
@@ -123,7 +136,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize images from an HDF5 dataset.")
     parser.add_argument("--dataset", type=str, 
                         default=os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")), 
-                                            "data", "low_dim_v141_randcam.hdf5"))
+                                            "data", "low_dim_v141_randcam_test.hdf5"))
     parser.add_argument("--output_dir", type=str, 
                         default=os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")), 
                                             "rendered_dataset_vis"))
